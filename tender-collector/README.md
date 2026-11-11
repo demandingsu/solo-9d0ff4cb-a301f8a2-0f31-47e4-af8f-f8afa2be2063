@@ -1,8 +1,13 @@
-# 市政工程投标截止时间采集服务
+# 市政工程投标截止时间采集与回执核对服务
 
 面向招投标专员的公告采集 API：提交市政工程公告站的**列表页地址**，服务自动遍历
 所有分页与详情页，将**更正公告按其引用的原公告编号归并**到同一项目，并**按发布
 时间**（而非页面排列顺序）确定当前生效的投标截止时间，标记是否已过期。
+
+同时提供**回执核对 API**：输入已采集的原公告编号、标段号、手头文件 SHA-256 与
+回执目录 URL，服务沿同站分页读取标书上传/撤回回执，按现行（更正后）投标截止时间
+过滤后，依据撤回链定位平台当前受理的末份未撤回上传，回答手头文件是否仍是平台
+受理版本；摘要冲突、撤回悬空或页面抓取失败时明确标记为无法判定。
 
 ## 核心规则
 
@@ -20,21 +25,45 @@
    归并校验失败时，本次采集不写入任何公告数据，**完整保留上次成功采集结果**；
    失败原因记入 `collection_runs` 表并通过 HTTP 422 返回。
 
+## 回执核对规则（`POST /api/receipt-check`）
+
+1. **截止时间过滤**：只处理该原公告 + 该标段、受理时间不晚于**现行更正后投标
+   截止时间**（含同一时刻）的回执；截止时间之后受理的上传/撤回一律忽略，并在
+   响应的 `ignored_after_deadline` 中列出。
+2. **撤回按引用生效**：撤回回执通过“撤回上传编号”作用于对应上传；引用的上传
+   编号在该标段没有对应记录时，撤回链无法自洽，结论为**无法判定**。
+3. **末份未撤回上传**：在从未被撤回的上传中取受理时间最新（同时间按回执编号
+   排序）的一份，作为平台当前受理版本；若全部上传均已撤回，则**没有有效上传**。
+4. **无法判定情形**：
+   - 同一受理时间存在多份上传且 SHA-256 摘要不一致（无法确定平台实际受理哪份）；
+   - 撤回引用的上传编号无对应记录；
+   - 回执目录任一列表页/详情页抓取失败（HTTP 非 2xx、网络错误、字段缺失）。
+   无法判定时 `status="undecidable"`、`file_matches=null`，具体原因见 `reasons`。
+5. **核对结论**：`matched`（手头文件与末份上传摘要一致）、`mismatch`（不一致）、
+   `no_valid_upload`（没有有效上传，明确说明原因）、`undecidable`（无法判定）。
+   比对大小写不敏感；输入的 SHA-256 必须为 64 位十六进制，否则 422。
+6. 判定与页面排列、抓取顺序完全无关（纯函数，按受理时间与编号确定性排序）。
+
 ## 目录结构
 
 ```
 tender-collector/
 ├── app/                    # FastAPI 应用
-│   ├── main.py             # 路由：/api/collect、/api/projects、/api/collections
+│   ├── main.py             # 路由：/api/collect、/api/receipt-check、/api/projects、/api/collections
 │   ├── service.py          # 采集编排 + 事务边界 + 过期判定
-│   ├── scraper.py          # httpx + BeautifulSoup 抓取/解析
+│   ├── scraper.py          # httpx + BeautifulSoup 公告抓取/解析
 │   ├── merge.py            # 更正归并与生效截止时间判定（纯函数）
+│   ├── receipt_service.py  # 回执核对编排：取现行截止时间 -> 抓回执 -> 判定
+│   ├── receipt_scraper.py  # 回执目录分页抓取/解析
+│   ├── receipt_merge.py    # 撤回生效、末份上传定位、无法判定规则（纯函数）
 │   ├── database.py         # SQLite 连接、建表、UPSERT
 │   ├── models.py           # Pydantic 模型
 │   └── config.py           # 环境变量配置
 ├── demo_site/              # 生成的本地分页 HTML 示例公告站（静态文件）
-├── scripts/generate_demo_site.py  # 示例站生成器（数据可复现）
-├── tests/test_collection.py       # 端到端 + 归并单元测试
+│   └── receipts/           # 标书上传/撤回回执目录子站（分页 + 详情）
+├── scripts/generate_demo_site.py  # 示例站与回执样例生成器（数据可复现）
+├── tests/test_collection.py       # 公告采集端到端 + 归并单元测试
+├── tests/test_receipt_check.py    # 回执核对端到端 + 判定/解析单元测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -56,7 +85,20 @@ curl -X POST http://localhost:8000/api/collect \
 
 # 4. 查询项目当前截止时间
 curl http://localhost:8000/api/projects
+
+# 5. 回执核对（先采集公告，再核对手头标书；回执目录在示例站 receipts/ 下）
+curl -X POST http://localhost:8000/api/receipt-check \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "original_code": "SZ-2026-001",
+    "section_code": "G1",
+    "file_sha256": "3f1b9c5e7a2d4f6081b9c5e7a2d4f6081b9c5e7a2d4f6081b9c5e7a2d4f6081b",
+    "receipt_list_url": "http://demo-site/receipts/receipt_list_1.html"
+  }'
 ```
+
+> 上例 SHA-256 仅为占位；可复现的样例摘要由生成器常量
+> `SAMPLE_FILE_HASHES` 给出（见下文“回执样例数据设计”）。
 
 容器内 API 通过 compose 网络访问示例站（主机名 `demo-site`）；从宿主机浏览
 示例站则打开 <http://localhost:8001/list_1.html>。SQLite 数据存于命名卷
@@ -135,6 +177,67 @@ curl -X POST http://localhost:8000/api/collect \
 
 包含每次采集的成功/失败状态、采集条数与错误信息。
 
+### `POST /api/receipt-check` — 回执核对：手头文件是否仍是平台受理版本
+
+请求：
+
+```json
+{
+  "original_code": "SZ-2026-001",
+  "section_code": "G1",
+  "file_sha256": "<64 位十六进制 SHA-256>",
+  "receipt_list_url": "http://demo-site/receipts/receipt_list_1.html"
+}
+```
+
+成功响应（200，`matched` 示例）：
+
+```json
+{
+  "status": "matched",
+  "file_matches": true,
+  "message": "手头文件与平台受理的末份未撤回上传 UP-001-3 摘要一致，确认是当前受理版本。",
+  "original_code": "SZ-2026-001",
+  "section_code": "G1",
+  "project_name": "滨河路市政改造工程",
+  "current_deadline": "2026-11-25 14:30",
+  "deadline_source_code": "SZ-2026-001-G1",
+  "deadline_source_url": "http://demo-site/SZ-2026-001-G1.html",
+  "receipt_list_url": "http://demo-site/receipts/receipt_list_1.html",
+  "effective_upload": {
+    "code": "UP-001-3",
+    "kind": "upload",
+    "accepted_at": "2026-11-22 16:40",
+    "file_sha256": "…",
+    "withdraws_code": null,
+    "detail_url": "http://demo-site/receipts/UP-001-3.html"
+  },
+  "valid_receipts": [ { "code": "UP-001-1", "kind": "upload", "…": "…" } ],
+  "source_urls": ["http://demo-site/receipts/UP-001-1.html", "…"],
+  "ignored_after_deadline": [
+    { "code": "UP-001-LATE", "kind": "upload", "…": "…" }
+  ],
+  "reasons": []
+}
+```
+
+`status` 取值与语义：
+
+| status | file_matches | 含义 |
+| --- | --- | --- |
+| `matched` | `true` | 手头文件与末份未撤回上传摘要一致 |
+| `mismatch` | `false` | 末份未撤回上传存在，但摘要不一致 |
+| `no_valid_upload` | `null` | 截止前没有未撤回的上传（含全部撤回/无记录），`message` 明确说明 |
+| `undecidable` | `null` | 摘要冲突、撤回引用悬空或页面抓取失败，原因见 `reasons` |
+
+说明：
+
+- 回执页面抓取失败**不返回 422**，而是 200 + `undecidable`（属于核对结论）；
+  仅请求本身不合法（原公告未采集、SHA-256 格式错误等）才返回 422。
+- `valid_receipts` 为截止前受理、且撤回引用可解析的全部回执；`source_urls`
+  为其来源链接（含末份上传详情页），便于人工复核。
+- `ignored_after_deadline` 列出截止时间之后受理、按规则忽略的记录。
+
 ## 示例站数据设计
 
 `demo_site/` 含 5 个项目、10 条公告、3 个列表页，列表按发布时间**倒序**排列
@@ -148,6 +251,30 @@ curl -X POST http://localhost:8000/api/collect \
 | 高新区雨污分流管网工程 | 更正不改截止时间 | 原公告 SZ-2026-004 |
 | 湖滨公园配套市政道路工程 | 原公告在末页、更正在首页（跨页乱序） | 更正公告 SZ-2026-005-G1 |
 
+## 回执样例数据设计
+
+`demo_site/receipts/` 含 23 份回执（上传/撤回）与 4 个分页，目录按受理时间
+**倒序**分页（最新记录在第一页），跨页乱序，判定不依赖页面顺序。场景如下：
+
+| 原公告/标段 | 截止时间 | 场景 | 核对结论 |
+| --- | --- | --- | --- |
+| SZ-2026-001 / G1 | 2026-11-25 14:30 | 两次上传均撤回后再上传；另有截止后的上传 | 末份 UP-001-3，截止后记录忽略 |
+| SZ-2026-002 / G1 | 2026-11-30 10:00 | 同一受理时间两份上传摘要不一致 | `undecidable` |
+| SZ-2026-002 / G2 | 2026-11-30 10:00 | 首份上传撤回、再上传；G9 标段为无关噪声 | 末份 UP-002G2-2，G9 不参与 |
+| SZ-2026-003 / G1 | 2026-10-30 17:00 | 两份上传均被撤回 | `no_valid_upload` |
+| SZ-2026-004 / G1 | 2026-11-28 09:30 | 撤回引用了不存在的上传编号 | `undecidable` |
+| SZ-2026-005 / G1 | 2026-11-20 15:00 | 截止后才受理的撤回不生效 | 末份 UP-005-2 仍有效 |
+
+样例中用于“手头文件”的确定性摘要由生成器常量 `SAMPLE_FILE_HASHES` 给出，
+测试直接引用；所有摘要均为对种子字符串取真实 SHA-256，可离线复现：
+
+```bash
+python3 -c "import importlib.util,sys; \
+spec=importlib.util.spec_from_file_location('g','scripts/generate_demo_site.py'); \
+m=importlib.util.module_from_spec(spec); sys.modules['g']=m; spec.loader.exec_module(m); \
+print(m.SAMPLE_FILE_HASHES)"
+```
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -159,11 +286,19 @@ curl -X POST http://localhost:8000/api/collect \
 
 ## 解析约定（接入真实站点时）
 
-解析器依赖以下稳定选择器，适配其他站点时调整 `app/scraper.py` 即可：
+解析器依赖以下稳定选择器，适配其他站点时调整 `app/scraper.py`、
+`app/receipt_scraper.py` 即可：
 
-- 列表页：`ul.announcement-list a.detail-link` 为详情链接，
+- 公告列表页：`ul.announcement-list a.detail-link` 为详情链接，
   `nav.pagination a` 为分页链接；
-- 详情页：`article.announcement-detail` 容器，支持
+- 公告详情页：`article.announcement-detail` 容器，支持
   `data-code` / `data-kind` / `data-published-at` / `data-corrects` 属性，
   以及 `table.detail-table` 内 `th[data-field="字段名"] + td` 表格字段
   （公告编号、公告类型、项目名称、发布时间、投标截止时间、原公告编号）。
+- 回执目录页：`ul.receipt-list a.receipt-link` 为回执详情链接，
+  `nav.pagination a` 为分页链接；
+- 回执详情页：`article.receipt-detail` 容器，支持
+  `data-code` / `data-kind` / `data-original-code` / `data-section-code` /
+  `data-accepted-at` / `data-withdraws` 属性，以及
+  `table.detail-table` 内字段：回执编号、回执类型、原公告编号、标段号、
+  受理时间、文件摘要SHA-256（上传）、撤回上传编号（撤回）。

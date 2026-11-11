@@ -29,6 +29,36 @@ def _sort_key(row: dict[str, Any]) -> tuple[str, str]:
     return (row["published_at"] or "", row["code"] or "")
 
 
+def effective_deadline_for_original(
+    rows: Iterable[dict[str, Any]], original_code: str
+) -> EffectiveDeadline:
+    """返回指定原公告项目当前生效的投标截止时间（复用全量归并的同一套规则）。"""
+    rows = list(rows)
+    originals = {r["code"]: r for r in rows if r["kind"] == "original"}
+    if original_code not in originals:
+        raise MergeError(f"原公告 {original_code} 不存在或不是原公告")
+
+    group = [originals[original_code]]
+    group.extend(
+        r
+        for r in rows
+        if r["kind"] == "correction" and r.get("corrects_code") == original_code
+    )
+    ordered = sorted(group, key=_sort_key)
+    source = next((r for r in reversed(ordered) if r.get("deadline")), None)
+    if source is None:
+        raise MergeError(
+            f"项目 {originals[original_code]['project_name']} "
+            "的所有公告均未给出投标截止时间"
+        )
+    return EffectiveDeadline(
+        project_name=originals[original_code]["project_name"],
+        deadline=source["deadline"],
+        source_code=source["code"],
+        source_url=source["detail_url"],
+    )
+
+
 def merge_projects(rows: Iterable[dict[str, Any]]) -> list[EffectiveDeadline]:
     rows = list(rows)
 
